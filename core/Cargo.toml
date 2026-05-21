@@ -1,0 +1,16 @@
+[package]
+name = "texsch"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "0.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+uuid = { version = "1.23.1", features = ["v4", "js"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+uuid = { version = "1.23.1", features = ["v4"] }

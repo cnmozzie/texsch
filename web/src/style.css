@@ -1,0 +1,37 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg: #1e1e1e;
+  --bg-panel: #252526;
+  --bg-tab: #2d2d2d;
+  --bg-tab-active: #1e1e1e;
+  --text: #cccccc;
+  --text-muted: #858585;
+  --border: #3c3c3c;
+  --accent: #569cd6;
+  --accent-bg: rgba(86, 156, 214, 0.15);
+
+  --mono: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', ui-monospace, Consolas, monospace;
+  --sans: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+}
+
+#app {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
