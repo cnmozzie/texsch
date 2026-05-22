@@ -10,7 +10,7 @@ self.MonacoEnvironment = {
   },
 }
 
-const DEFAULT_INPUT = 'GND --- -R1(24.9)- --- -C1(10u)- --- VCC'
+const DEFAULT_INPUT = '[VCC] ------- * ------- [OUT]\n              |\n              R2:1\n              R2:2'
 
 const svgContent = ref('')
 const kicadContent = ref('')

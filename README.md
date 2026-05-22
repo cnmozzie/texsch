@@ -1,21 +1,24 @@
 # Texsch — Text-based Schematic Compiler
 
-ASCII circuit schematics → SVG preview + KiCad S-expression files, in the browser.
+2D ASCII circuit schematics → SVG preview + KiCad S-expression files, in the browser.
 
 ```
-GND --- -R1(24.9)- --- -C1(10u)- --- VCC
+[VCC] ------- * ------- [OUT]
+              |
+              R2:1
+              R2:2
 ```
 
-A single line of text produces a fully-routed schematic with standard KiCad library symbols, ready to open in KiCad or embed anywhere as SVG.
+A grid of text produces a fully-routed schematic with standard KiCad library symbols, ready to open in KiCad or embed anywhere as SVG.
 
 ## Features
 
-- **Text-first**: describe circuits with a compact ASCII syntax — one line = one signal chain
+- **2D ASCII schematics**: describe circuits with a spatial grid — components, wires, junctions, and labels placed freely
 - **Live preview**: Monaco-powered editor with instant WASM compilation on every keystroke
 - **Dual output**: SVG render for visualization + KiCad `.kicad_sch` S-expression for EDA import
 - **Standard library symbols**: uses `Device:R`, `Device:C`, `Device:L` from KiCad's built-in library
 - **Zero server**: everything runs client-side via WebAssembly (Rust → WASM)
-- **MVP component set**: Resistor (R), Capacitor (C), Inductor (L) with refdes and value support
+- **MVP component set**: Resistor (R), Capacitor (C), Inductor (L)
 
 ## Quick Start
 
@@ -33,10 +36,9 @@ Open the URL printed by Vite (default `http://localhost:5173`). Type a schematic
 
 ```bash
 cd core
-cargo run --example smoke
+cargo test    # run 48 tests
+cargo build   # compile native binary
 ```
-
-Produces `example_output.svg` and `example_output.kicad_sch` in the project root.
 
 ### Rebuild WASM
 
@@ -44,56 +46,65 @@ Produces `example_output.svg` and `example_output.kicad_sch` in the project root
 ./build-wasm.sh
 ```
 
-Requires `rustc` 1.95+, `wasm32-unknown-unknown` target, and `wasm-bindgen` CLI on `$PATH`.
+## Syntax — Port-based Grid Architecture
 
-## Syntax
+A schematic is a 2D text grid. Place **nodes** at specific character positions, and connect them with wire characters (`-` for horizontal, `|` for vertical).
 
-A schematic line is a sequence of **labels**, **wires**, and **components** separated by whitespace.
+### Nodes
 
-### Labels
-
-Any bare word that is not a wire or component is a net label:
-
-```
-GND    VCC    VIN    OUT    NET1
-```
+| Token | Node Type | Description |
+|-------|-----------|-------------|
+| `[NAME]` | Label | Net label, e.g. `[VCC]`, `[GND]`, `[OUT]` |
+| `R1:1`, `R1:2` | Port | Component pin — pin 1 and pin 2 of refdes |
+| `C1:1`, `C1:2` | Port | Capacitor pins |
+| `L1:1`, `L1:2` | Port | Inductor pins |
+| `*` | Junction | Electrical connection dot (4-way intersection) |
+| `+` | Corner | Wire crossing without electrical connection |
 
 ### Wires
 
-One or more consecutive dashes connect adjacent elements:
+Use `-` (dash) for horizontal wires between nodes on the same row. Use `|` (pipe) for vertical wires between nodes on the same column.
 
+### Component Placement
+
+Components are formed by two ports of the same refdes on **adjacent** grid positions:
+- Same row, adjacent columns → **Horizontal** component
+- Same column, adjacent rows → **Vertical** component
+
+### Topology Examples
+
+**T-Junction** (junction dot at `*`):
 ```
----    ------    -
-```
-
-Longer wires create more visual spacing; electrically they are transparent.
-
-### Components
-
-```
--<REFDES>(<VALUE>)-
-```
-
-| Element  | Meaning          | Example   |
-| -------- | ---------------- | --------- |
-| `R1`     | Resistor refdes  | `-R1(10k)-` |
-| `C3`     | Capacitor refdes | `-C3(47u)-` |
-| `L2`     | Inductor refdes  | `-L2(4.7mH)-` |
-
-The refdes must start with `R`, `C`, or `L` followed by at least one digit. The value can be any text (conventionally `10k`, `47u`, `4.7mH`, etc.).
-
-### Examples
-
-```
-GND --- -R1(24.9)- --- -C1(10u)- --- VCC
+[VCC] ------- * ------- [OUT]
+              |
+              R2:1
+              R2:2
 ```
 
+**Corner** (no dot at `+`):
 ```
--L1(10mH)- --- -C2(47u)- --- GND
+[VCC] ---+
+         |
+         R1:1
+         R1:2
 ```
 
+**Crossing without Connection** (no dot at `+`):
 ```
-VIN --- -R1(1k)- --- -C1(100n)- --- -L1(10uH)- --- OUT
+         [Y1]
+          |
+[X1] ----+---- [X2]
+          |
+         [Y2]
+```
+
+**Cross-Junction** (junction dot at `*`):
+```
+          [UP]
+           |
+[LEFT] --- * --- [RIGHT]
+           |
+         [DOWN]
 ```
 
 ## Architecture
@@ -102,12 +113,10 @@ VIN --- -R1(1k)- --- -C1(100n)- --- -L1(10uH)- --- OUT
 texsch/
 ├── core/               Rust compiler crate
 │   ├── src/
-│   │   ├── lib.rs      WASM exports + core types
-│   │   ├── parser.rs   Lexer & linear-layout parser
-│   │   ├── svg.rs      SVG renderer
-│   │   └── kicad.rs    KiCad S-expression generator
-│   ├── examples/
-│   │   └── smoke.rs    CLI demo
+│   │   ├── lib.rs      WASM exports + compile() pipeline
+│   │   ├── parser.rs   Scanner, compression, pairing, spans, layout, wire extraction
+│   │   ├── svg.rs      SVG renderer (symbols, wires, junction dots, span debug)
+│   │   └── kicad.rs    KiCad S-expression generator (symbols, wires, junctions)
 │   └── Cargo.toml
 ├── web/                Vue 3 + Vite + TypeScript frontend
 │   ├── src/
@@ -119,35 +128,21 @@ texsch/
 └── README.md
 ```
 
-**Pipeline**: ASCII text → `parser::tokenize` → `parser::build_circuit` → `Circuit` IR → `svg::generate` + `kicad::generate`
+**Pipeline**: ASCII text → `scan_nodes` → `compress_coordinates` → `pair_components` → `compute_spans` → `compute_layout` → `extract_wires` → SVG + KiCad output
 
-## Building from Source
+### Steps
 
-### Prerequisites
-
-- Rust 1.95+ with `wasm32-unknown-unknown` target
-- `wasm-bindgen` CLI (`cargo install wasm-bindgen-cli`)
-- Node.js 18+ with `cnpm`
-
-### All targets
-
-```bash
-# Native Rust
-cd core && cargo build
-
-# Run tests
-cd core && cargo test
-
-# WASM
-./build-wasm.sh
-
-# Web frontend
-cd web && cnpm install && cnpm run build
-```
+1. **Scan** — walk the 2D character grid, identify Labels `[...]`, Junctions `*`, Corners `+`, and Ports `R1:1`
+2. **Compress** — map sparse absolute coordinates to dense grid indices
+3. **Pair** — match port pairs by refdes, validate adjacency, determine orientation
+4. **Span** — compute four-direction bounding boxes for each node based on type and orientation
+5. **Layout** — dynamic grid spacing (`col_x`, `row_y`) from span extents with configurable `MIN_GAP`
+6. **Wires** — grid-neighbor routing: connect adjacent nodes on same row if `-` present, same column if `|` present
+7. **Render** — SVG (symbols, wires, junction dots, span debug boxes) and KiCad S-expression (symbols, wires, junctions)
 
 ## KiCad Compatibility
 
-The generated `.kicad_sch` files use the KiCad S-expression format. Symbols reference KiCad's standard `Device` library (`Device:R`, `Device:C`, `Device:L`), so the schematic opens directly in KiCad without any custom library setup.
+Generated `.kicad_sch` files use the KiCad S-expression format. Symbols reference KiCad's standard `Device` library, so the schematic opens directly in KiCad without custom library setup. Wire endpoints use correct pin offsets (3.81 mm) matching the Device symbol definitions.
 
 ## License
 

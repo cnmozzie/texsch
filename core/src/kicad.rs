@@ -37,11 +37,17 @@ pub fn generate(circuit: &Circuit) -> String {
     // ---- lib_symbols -----------------------------------------------------
     emit_lib_symbols(&mut s);
 
-    // ---- layout: walk the linear chain and collect positions -------------
+    // ---- layout: compute positions -------------------------------------
     let mut comp_positions: Vec<(String, f64)> = Vec::new(); // (refdes, x_mm)
     let mut label_positions: Vec<(String, f64)> = Vec::new(); // (name, x_mm)
 
-    layout_chain(circuit, &mut comp_positions, &mut label_positions);
+    if circuit.label_x.is_empty() {
+        // Legacy pipeline: sequential layout from token stream.
+        layout_chain(circuit, &mut comp_positions, &mut label_positions);
+    } else {
+        // 2D pipeline: positions derived from grid coordinates.
+        layout_from_grid(circuit, &mut comp_positions, &mut label_positions);
+    }
 
     // ---- wires -----------------------------------------------------------
     for (i, seg) in circuit.connections.iter().enumerate() {
@@ -212,6 +218,25 @@ pub fn generate(circuit: &Circuit) -> String {
 // ---------------------------------------------------------------------------
 // layout helpers
 // ---------------------------------------------------------------------------
+
+/// Derive KiCad positions (mm) from raw grid column midpoints.
+fn layout_from_grid(
+    circuit: &Circuit,
+    comp_pos: &mut Vec<(String, f64)>,
+    lbl_pos: &mut Vec<(String, f64)>,
+) {
+    const KICAD_X_SCALE: f64 = 2.0; // mm per grid column
+    const KICAD_BASE_X: f64 = 100.0;
+
+    for comp in &circuit.components {
+        let cx = KICAD_BASE_X + comp.x * KICAD_X_SCALE;
+        comp_pos.push((comp.refdes.clone(), cx));
+    }
+    for (name, x) in &circuit.label_x {
+        let lx = KICAD_BASE_X + (*x) * KICAD_X_SCALE;
+        lbl_pos.push((name.clone(), lx));
+    }
+}
 
 /// Walk the linear chain and compute x positions for components and labels.
 fn layout_chain(
@@ -457,4 +482,330 @@ fn emit_arc(s: &mut String, sx: f64, sy: f64, mx: f64, my: f64, ex: f64, ey: f64
     s.push_str("          (stroke (width 0.254) (type default))\n");
     s.push_str("          (fill (type none))\n");
     s.push_str("        )\n");
+}
+
+// ============================================================
+// Step 3: KiCad output from placed components
+// ============================================================
+
+use crate::parser::{Orientation, PlacedComponent, SchematicNode, NodeType};
+
+const KICAD_SCALE: f64 = 0.15; // mm per SVG px
+const KICAD_BASE_X: f64 = 50.0;
+const KICAD_BASE_Y: f64 = 50.0;
+
+fn svg_to_kicad_x(px: f64) -> f64 {
+    KICAD_BASE_X + px * KICAD_SCALE
+}
+
+fn svg_to_kicad_y(px: f64) -> f64 {
+    KICAD_BASE_Y + px * KICAD_SCALE
+}
+
+/// KiCad pin offset from symbol centre (mm).  All Device:R / Device:C / Device:L
+/// symbols place their pins at ±3.81 mm in the default (vertical) orientation.
+const KICAD_PIN_OFFSET: f64 = 3.81;
+
+/// Compute the physical KiCad (mm) connection point for a schematic node.
+fn kicad_endpoint(
+    node: &SchematicNode,
+    placed: &[PlacedComponent],
+    col_x: &[f64],
+    row_y: &[f64],
+) -> (f64, f64) {
+    match &node.node_type {
+        NodeType::Port { refdes, pin } => {
+            if let Some(comp) = placed.iter().find(|c| c.refdes == *refdes) {
+                let (cx_svg, cy_svg) =
+                    crate::parser::component_physical_center(comp, col_x, row_y);
+                let cx = svg_to_kicad_x(cx_svg);
+                let cy = svg_to_kicad_y(cy_svg);
+                match (comp.orientation, pin) {
+                    (Orientation::Horizontal, 1) => (cx - KICAD_PIN_OFFSET, cy),
+                    (Orientation::Horizontal, 2) => (cx + KICAD_PIN_OFFSET, cy),
+                    (Orientation::Vertical, 1) => (cx, cy - KICAD_PIN_OFFSET),
+                    (Orientation::Vertical, 2) => (cx, cy + KICAD_PIN_OFFSET),
+                    _ => (svg_to_kicad_x(col_x[node.grid_col]), svg_to_kicad_y(row_y[node.grid_row])),
+                }
+            } else {
+                (svg_to_kicad_x(col_x[node.grid_col]), svg_to_kicad_y(row_y[node.grid_row]))
+            }
+        }
+        // Labels, junctions, corners → grid centre in mm.
+        _ => (svg_to_kicad_x(col_x[node.grid_col]), svg_to_kicad_y(row_y[node.grid_row])),
+    }
+}
+
+/// A straight wire in KiCad mm coordinates.
+struct KicadWire {
+    x1: f64, y1: f64, x2: f64, y2: f64,
+}
+
+/// Re-extract wires from the ASCII grid, computing endpoints in KiCad mm
+/// using the correct [`KICAD_PIN_OFFSET`].
+fn extract_kicad_wires(
+    nodes: &[SchematicNode],
+    placed: &[PlacedComponent],
+    col_x: &[f64],
+    row_y: &[f64],
+    input: &str,
+) -> Vec<KicadWire> {
+    let grid: Vec<Vec<char>> = input.lines().map(|l| l.chars().collect()).collect();
+    let max_row = nodes.iter().map(|n| n.grid_row).max().unwrap_or(0);
+    let max_col = nodes.iter().map(|n| n.grid_col).max().unwrap_or(0);
+
+    let mut node_at: std::collections::HashMap<(usize, usize), &SchematicNode> =
+        std::collections::HashMap::new();
+    for n in nodes {
+        node_at.insert((n.grid_row, n.grid_col), n);
+    }
+
+    let mut wires = Vec::new();
+
+    // ---- horizontal --------------------------------------------------------
+    for r in 0..=max_row {
+        let mut row_nodes: Vec<&SchematicNode> = (0..=max_col)
+            .filter_map(|c| node_at.get(&(r, c)))
+            .copied()
+            .collect();
+        row_nodes.sort_by_key(|n| n.grid_col);
+
+        for w in row_nodes.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let ascii_row = a.pos.row;
+            let c1 = a.pos.col.min(b.pos.col);
+            let c2 = a.pos.col.max(b.pos.col);
+            let has_dash = (c1..c2).any(|col| {
+                grid.get(ascii_row).and_then(|line| line.get(col)) == Some(&'-')
+            });
+            if has_dash {
+                let (x1, y1) = kicad_endpoint(a, placed, col_x, row_y);
+                let (x2, y2) = kicad_endpoint(b, placed, col_x, row_y);
+                wires.push(KicadWire { x1, y1, x2, y2 });
+            }
+        }
+    }
+
+    // ---- vertical ----------------------------------------------------------
+    for c in 0..=max_col {
+        let mut col_nodes: Vec<&SchematicNode> = (0..=max_row)
+            .filter_map(|r| node_at.get(&(r, c)))
+            .copied()
+            .collect();
+        col_nodes.sort_by_key(|n| n.grid_row);
+
+        for w in col_nodes.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let ascii_col = a.pos.col;
+            let r1 = a.pos.row.min(b.pos.row);
+            let r2 = a.pos.row.max(b.pos.row);
+            let has_pipe = (r1..r2).any(|row| {
+                grid.get(row).and_then(|line| line.get(ascii_col)) == Some(&'|')
+            });
+            if has_pipe {
+                let (x1, y1) = kicad_endpoint(a, placed, col_x, row_y);
+                let (x2, y2) = kicad_endpoint(b, placed, col_x, row_y);
+                wires.push(KicadWire { x1, y1, x2, y2 });
+            }
+        }
+    }
+
+    wires
+}
+
+/// Generate KiCad S-expression with placed components, labels, wires, and junctions.
+/// Uses dynamic `col_x` / `row_y` arrays from [`crate::parser::compute_layout`].
+pub fn generate_step3(
+    placed: &[PlacedComponent],
+    labels: &[(String, usize, usize)], // (name, grid_row, grid_col)
+    nodes: &[SchematicNode],
+    col_x: &[f64],
+    row_y: &[f64],
+    input: &str,
+) -> String {
+    let mut s = String::new();
+    let proj_uuid = project_uuid().to_string();
+
+    // ---- header ----------------------------------------------------------
+    s.push_str("(kicad_sch\n");
+    s.push_str("  (version 20260306)\n");
+    s.push_str("  (generator \"texsch\")\n");
+    s.push_str("  (generator_version \"0.1\")\n");
+    s.push_str(&format!("  (uuid \"{}\")\n", proj_uuid));
+    s.push_str("  (paper \"A4\")\n");
+
+    // ---- lib_symbols -----------------------------------------------------
+    emit_lib_symbols(&mut s);
+
+    // ---- junctions -------------------------------------------------------
+    for node in nodes {
+        if matches!(node.node_type, NodeType::Junction) {
+            let jx = svg_to_kicad_x(col_x[node.grid_col]);
+            let jy = svg_to_kicad_y(row_y[node.grid_row]);
+            s.push_str("  (junction\n");
+            s.push_str(&format!("    (at {:.2} {:.2})\n", jx, jy));
+            s.push_str("    (diameter 0)\n");
+            s.push_str("    (color 0 0 0 0)\n");
+            s.push_str(&format!(
+                "    (uuid \"{}\")\n",
+                make_uuid(5000 + node.grid_row as u128 * 100 + node.grid_col as u128)
+            ));
+            s.push_str("  )\n");
+        }
+    }
+
+    // ---- labels ----------------------------------------------------------
+    for (i, (name, grid_row, grid_col)) in labels.iter().enumerate() {
+        let lx = svg_to_kicad_x(col_x[*grid_col]);
+        let ly = svg_to_kicad_y(row_y[*grid_row]);
+
+        s.push_str("  (label\n");
+        s.push_str(&format!("    \"{}\"\n", name));
+        s.push_str(&format!("    (at {:.2} {:.2} 0)\n", lx, ly));
+        s.push_str("    (effects\n");
+        s.push_str("      (font (size 1.27 1.27))\n");
+        s.push_str("      (justify left bottom)\n");
+        s.push_str("    )\n");
+        s.push_str(&format!("    (uuid \"{}\")\n", make_uuid(3000 + i as u128)));
+        s.push_str("  )\n");
+    }
+
+    // ---- wires (native KiCad mm endpoints) -------------------------------
+    let kicad_wires = extract_kicad_wires(nodes, placed, col_x, row_y, input);
+    for (i, w) in kicad_wires.iter().enumerate() {
+        s.push_str("  (wire\n");
+        s.push_str(&format!(
+            "    (pts (xy {:.2} {:.2}) (xy {:.2} {:.2}))\n",
+            w.x1, w.y1, w.x2, w.y2
+        ));
+        s.push_str("    (stroke (width 0) (type default))\n");
+        s.push_str(&format!("    (uuid \"{}\")\n", make_uuid(4000 + i as u128)));
+        s.push_str("  )\n");
+    }
+
+    // ---- symbols (instances) ---------------------------------------------
+    for (i, comp) in placed.iter().enumerate() {
+        let (cx_px, cy_px) =
+            crate::parser::component_physical_center(comp, col_x, row_y);
+        let cx = svg_to_kicad_x(cx_px);
+        let cy = svg_to_kicad_y(cy_px);
+
+        // KiCad Device symbols have pins at top/bottom by default (vertical).
+        // Rotate 90 for horizontal placement (pins left/right).
+        let angle: i32 = match comp.orientation {
+            Orientation::Horizontal => 90,
+            Orientation::Vertical => 0,
+        };
+
+        s.push_str("  (symbol\n");
+        s.push_str(&format!(
+            "    (lib_id \"{}\")\n",
+            comp.comp_type.lib_name()
+        ));
+        s.push_str(&format!("    (at {:.2} {:.2} {})\n", cx, cy, angle));
+        s.push_str("    (unit 1)\n");
+        s.push_str("    (body_style 1)\n");
+        s.push_str("    (exclude_from_sim no)\n");
+        s.push_str("    (in_bom yes)\n");
+        s.push_str("    (on_board yes)\n");
+        s.push_str("    (in_pos_files yes)\n");
+        s.push_str("    (dnp no)\n");
+        s.push_str("    (fields_autoplaced yes)\n");
+        s.push_str(&format!("    (uuid \"{}\")\n", make_uuid(i as u128 * 2)));
+
+        // Reference
+        s.push_str(&format!(
+            "    (property \"Reference\" \"{}\"\n",
+            comp.refdes
+        ));
+        s.push_str(&format!(
+            "      (at {:.2} {:.2} {})\n",
+            cx, cy - 6.35, angle
+        ));
+        s.push_str("      (show_name no)\n");
+        s.push_str("      (do_not_autoplace no)\n");
+        s.push_str("      (effects (font (size 1.27 1.27)))\n");
+        s.push_str("    )\n");
+
+        // Value
+        s.push_str(&format!(
+            "    (property \"Value\" \"{}\"\n",
+            comp.refdes
+        ));
+        s.push_str(&format!(
+            "      (at {:.2} {:.2} {})\n",
+            cx, cy - 3.81, angle
+        ));
+        s.push_str("      (show_name no)\n");
+        s.push_str("      (do_not_autoplace no)\n");
+        s.push_str("      (effects (font (size 1.27 1.27)))\n");
+        s.push_str("    )\n");
+
+        // Footprint
+        s.push_str("    (property \"Footprint\" \"\"\n");
+        s.push_str(&format!("      (at {:.2} {:.2} 0)\n", cx + 3.81, cy));
+        s.push_str("      (hide yes)\n");
+        s.push_str("      (show_name no)\n");
+        s.push_str("      (do_not_autoplace no)\n");
+        s.push_str("      (effects (font (size 1.27 1.27)))\n");
+        s.push_str("    )\n");
+
+        // Datasheet
+        s.push_str("    (property \"Datasheet\" \"\"\n");
+        s.push_str(&format!("      (at {:.2} {:.2} 0)\n", cx, cy));
+        s.push_str("      (hide yes)\n");
+        s.push_str("      (show_name no)\n");
+        s.push_str("      (do_not_autoplace no)\n");
+        s.push_str("      (effects (font (size 1.27 1.27)))\n");
+        s.push_str("    )\n");
+
+        // Description
+        let desc = match comp.comp_type {
+            crate::CompType::Resistor => "Resistor",
+            crate::CompType::Capacitor => "Unpolarized capacitor",
+            crate::CompType::Inductor => "Inductor",
+        };
+        s.push_str(&format!(
+            "    (property \"Description\" \"{}\"\n", desc
+        ));
+        s.push_str(&format!("      (at {:.2} {:.2} 0)\n", cx, cy));
+        s.push_str("      (hide yes)\n");
+        s.push_str("      (show_name no)\n");
+        s.push_str("      (do_not_autoplace no)\n");
+        s.push_str("      (effects (font (size 1.27 1.27)))\n");
+        s.push_str("    )\n");
+
+        // Pins
+        s.push_str(&format!(
+            "    (pin \"1\" (uuid \"{}\"))\n",
+            make_uuid(1000 + i as u128 * 2)
+        ));
+        s.push_str(&format!(
+            "    (pin \"2\" (uuid \"{}\"))\n",
+            make_uuid(1001 + i as u128 * 2)
+        ));
+
+        // Instances
+        s.push_str("    (instances\n");
+        s.push_str("      (project \"\"\n");
+        s.push_str(&format!("        (path \"/{}\"\n", proj_uuid));
+        s.push_str(&format!("          (reference \"{}\")\n", comp.refdes));
+        s.push_str("          (unit 1)\n");
+        s.push_str("        )\n");
+        s.push_str("      )\n");
+        s.push_str("    )\n");
+
+        s.push_str("  )\n");
+    }
+
+    // ---- sheet_instances -------------------------------------------------
+    s.push_str("  (sheet_instances\n");
+    s.push_str("    (path \"/\" (page \"1\"))\n");
+    s.push_str("  )\n");
+
+    // ---- footer ----------------------------------------------------------
+    s.push_str("  (embedded_fonts no)\n");
+    s.push_str(")\n");
+
+    s
 }
