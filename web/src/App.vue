@@ -10,7 +10,35 @@ self.MonacoEnvironment = {
   },
 }
 
-const DEFAULT_INPUT = '[VCC] ------- * ------- [OUT]\n              |\n              R2:1\n              R2:2'
+const DEFAULT_INPUT = `U1: OPA330xxD
+R1: R
+R2: R
+R3: R
+J1: Conn_01x03_Socket
+J2: Conn_Coaxial
+J3: Conn_Coaxial
+J4: Conn_Coaxial
+#GND1: GND
+#GND2: GND
+#GND3: GND
+#GND4: GND
+#VCC1: VCC
+#VSS1: VSS
+=============================================
+[In1]--J3:1<                                                       #VCC1:1v
+        J3:2v                                                      |
+        |                                                          U1:7(V+)^
+        #GND3:1^                  +------------------------------U1:3(+)<
+                                  |                                       U1:6>--------*--------+--[OUT]
+                                  #GND1:1^             +---------U1:2(-)<              |        |
+[In2]--J4:1<                                           |           U1:4(V-)v           |        |
+        J4:2v                                          |           |                   |        +--J2:1<
+        |                                              |           #VSS1:1^            |            J2:2v
+        #GND4:1^            [In1]--R1:1< R1:2>---------*                               |            |
+                                                       |                               |            #GND2:1^
+[VCC]--J1:1<                [In2]--R2:1< R2:2>---------*                               |
+[GND]--J1:2<                                           |                               |
+[VSS]--J1:3<                                           +------------------R3:1< R3:2>--*`
 
 const svgContent = ref('')
 const kicadContent = ref('')

@@ -1,252 +1,33 @@
-use crate::{Circuit, CompType, NetEndpoint};
+use crate::parser::{DrawPrimitive, MatchedComponent, NodeSpan, NodeType, PinDirection, SchematicNode, WireSegment, HALF_SPAN, MARGIN, CELL_W, CELL_H};
 
-const COMP_SPAN: f64 = 60.0;
-const Y_CENTER: f64 = 100.0;
-const FONT_SIZE: f64 = 12.0;
+/// Convert KiCad mm to SVG px.
+const SVG_PX_PER_MM: f64 = CELL_W / 2.54;
 
-const COLOR_COMPONENT: &str = "#8B0000";
-const COLOR_WIRE: &str = "#2E7D32";
-const COLOR_NETLABEL: &str = "#1B5E20";
+fn mm_to_px(mm: f64) -> f64 { mm * SVG_PX_PER_MM }
 
-/// SVG pixels per grid column (2D pipeline only).
-const SVG_X_SCALE: f64 = 12.0;
-const SVG_X_MARGIN: f64 = 20.0;
-
-fn grid_to_svg(grid_col: f64) -> f64 {
-    SVG_X_MARGIN + grid_col * SVG_X_SCALE
-}
-
-/// Symbol half-width in SVG px for a component type.
-fn symbol_hw(ct: CompType) -> f64 {
-    match ct {
-        CompType::Resistor => 30.0,
-        CompType::Capacitor => 6.0,
-        CompType::Inductor => 30.0,
-    }
-}
-
-pub fn generate(circuit: &Circuit) -> String {
-    let is_2d = !circuit.label_x.is_empty();
-
-    // --- pre-compute SVG-pixel x for every component --------------------
-    let comp_x: Vec<f64> = circuit
-        .components
-        .iter()
-        .map(|c| if is_2d { grid_to_svg(c.x) } else { c.x })
-        .collect();
-
-    // --- pre-compute SVG-pixel x for every label -----------------------
-    let label_x: Vec<(String, f64)> = if is_2d {
-        circuit
-            .label_x
-            .iter()
-            .map(|(n, x)| (n.clone(), grid_to_svg(*x)))
-            .collect()
-    } else {
-        // Legacy pipeline: infer label positions from connections.
-        let mut out = Vec::new();
-        for seg in &circuit.connections {
-            for (ep, side) in [(&seg.from, 0usize), (&seg.to, 1)] {
-                if let NetEndpoint::Label(name) = ep {
-                    if out.iter().any(|(n, _)| n == name) {
-                        continue;
-                    }
-                    let lx = if side == 0 {
-                        20.0 // left-side labels at margin
-                    } else {
-                        // right-side label: after the from endpoint
-                        let from_x = endpoint_x(&seg.from, &comp_x, &circuit.components, &out);
-                        from_x + 50.0
-                    };
-                    out.push((name.clone(), lx));
-                }
-            }
-        }
-        out
+/// Rotate a [`PinDirection`] by `-angle_deg` so that when the SVG group is
+/// rotated by `angle_deg` the pin appears to face the original direction.
+fn rotate_pin_dir(dir: PinDirection, angle_deg: f64) -> PinDirection {
+    if angle_deg == 0.0 { return dir; }
+    let (dx, dy): (f64, f64) = match dir {
+        PinDirection::Left  => (-1.0, 0.0),
+        PinDirection::Right => (1.0, 0.0),
+        PinDirection::Up    => (0.0, -1.0),
+        PinDirection::Down  => (0.0, 1.0),
     };
-
-    let mut elements = String::new();
-    let mut max_x: f64 = 20.0;
-
-    // ---- wires --------------------------------------------------------
-    for seg in &circuit.connections {
-        let x1 = endpoint_x(&seg.from, &comp_x, &circuit.components, &label_x);
-        let x2 = endpoint_x(&seg.to, &comp_x, &circuit.components, &label_x);
-        let xl = x1.min(x2);
-        let xr = x1.max(x2);
-        elements.push_str(&format!(
-            r#"<line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="{}" stroke-width="1.5"/>"#,
-            xl, Y_CENTER, xr, Y_CENTER, COLOR_WIRE
-        ));
-        if xr > max_x {
-            max_x = xr;
-        }
-    }
-
-    // ---- component symbols --------------------------------------------
-    for (i, comp) in circuit.components.iter().enumerate() {
-        let cx = comp_x[i];
-        match comp.comp_type {
-            CompType::Resistor => draw_resistor(&mut elements, cx, Y_CENTER),
-            CompType::Capacitor => draw_capacitor(&mut elements, cx, Y_CENTER),
-            CompType::Inductor => draw_inductor(&mut elements, cx, Y_CENTER),
-        }
-        elements.push_str(&format!(
-            r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" font-size="{:.0}" fill="{}">{}</text>"#,
-            cx, Y_CENTER - 16.0, FONT_SIZE, COLOR_COMPONENT, comp.refdes
-        ));
-        elements.push_str(&format!(
-            r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" font-size="{:.0}" fill="{}">{}</text>"#,
-            cx, Y_CENTER + 24.0, FONT_SIZE, COLOR_COMPONENT, comp.value
-        ));
-        if cx + symbol_hw(comp.comp_type) > max_x {
-            max_x = cx + symbol_hw(comp.comp_type);
-        }
-    }
-
-    // ---- net labels ---------------------------------------------------
-    let mut drawn: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for seg in &circuit.connections {
-        for ep in [&seg.from, &seg.to] {
-            if let NetEndpoint::Label(name) = ep {
-                if drawn.contains(name) {
-                    continue;
-                }
-                drawn.insert(name.clone());
-                let lx = label_x.iter().find(|(n, _)| n == name).map(|(_, x)| *x).unwrap_or(20.0);
-                elements.push_str(&format!(
-                    r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" font-size="{:.0}" font-weight="bold" fill="{}">{}"#,
-                    lx, Y_CENTER - 14.0, FONT_SIZE, COLOR_NETLABEL, name
-                ));
-                elements.push_str("</text>");
-            }
-        }
-    }
-    // Orphan labels (from label_x but not in any connection).
-    for (name, lx) in &label_x {
-        if !drawn.contains(name) {
-            drawn.insert(name.clone());
-            elements.push_str(&format!(
-                r#"<text x="{:.1}" y="{:.1}" text-anchor="middle" font-size="{:.0}" font-weight="bold" fill="{}">{}"#,
-                lx, Y_CENTER - 14.0, FONT_SIZE, COLOR_NETLABEL, name
-            ));
-            elements.push_str("</text>");
-            if *lx > max_x {
-                max_x = *lx;
-            }
-        }
-    }
-
-    let width = (max_x + 30.0).max(200.0);
-    let height: f64 = 200.0;
-
-    format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {:.0} {:.0}" width="{:.0}" height="{:.0}">{}</svg>"#,
-        width, height, width, height, elements
-    )
-}
-
-// -----------------------------------------------------------------------
-// position helpers
-// -----------------------------------------------------------------------
-
-fn endpoint_x(
-    ep: &NetEndpoint,
-    comp_x: &[f64],
-    comps: &[crate::Component],
-    label_x: &[(String, f64)],
-) -> f64 {
-    match ep {
-        NetEndpoint::Label(name) => {
-            label_x.iter().find(|(n, _)| n == name).map(|(_, x)| *x).unwrap_or(20.0)
-        }
-        NetEndpoint::ComponentPin { refdes, pin } => {
-            let i = comps.iter().position(|c| c.refdes == *refdes).unwrap();
-            let cx = comp_x[i];
-            let hw = symbol_hw(comps[i].comp_type);
-            if *pin == 0 { cx - hw } else { cx + hw }
-        }
+    let a = (-angle_deg).to_radians(); // inverse rotation (group → local)
+    let (c, s) = (a.cos(), a.sin());
+    let rx = dx * c - dy * s;
+    let ry = dx * s + dy * c;
+    if rx.abs() > ry.abs() {
+        if rx > 0.0 { PinDirection::Right } else { PinDirection::Left }
+    } else {
+        if ry > 0.0 { PinDirection::Down } else { PinDirection::Up }
     }
 }
-
-// -----------------------------------------------------------------------
-// symbol drawing
-// -----------------------------------------------------------------------
-
-fn draw_resistor(buf: &mut String, cx: f64, cy: f64) {
-    let half = COMP_SPAN / 2.0;
-    let h = 14.0;
-    let segs = 6;
-    let step = COMP_SPAN / segs as f64;
-    let mut d = format!("M {:.1} {:.1} ", cx - half, cy);
-    for i in 0..segs {
-        let sx = cx - half + step * i as f64 + step / 2.0;
-        let sy = if i % 2 == 0 { cy - h } else { cy + h };
-        d.push_str(&format!("L {:.1} {:.1} ", sx, sy));
-    }
-    d.push_str(&format!("L {:.1} {:.1}", cx + half, cy));
-    buf.push_str(&format!(
-        r#"<path d="{}" fill="none" stroke="{}" stroke-width="1.5"/>"#,
-        d, COLOR_COMPONENT
-    ));
-}
-
-fn draw_capacitor(buf: &mut String, cx: f64, cy: f64) {
-    let half = COMP_SPAN / 2.0;
-    let gap = 6.0;
-    let h = 18.0;
-
-    buf.push_str(&format!(
-        r#"<line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="{}" stroke-width="1.5"/>"#,
-        cx - half, cy, cx - gap, cy, COLOR_COMPONENT,
-    ));
-    buf.push_str(&format!(
-        r#"<line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="{}" stroke-width="1.5"/>"#,
-        cx - gap, cy - h, cx - gap, cy + h, COLOR_COMPONENT,
-    ));
-    buf.push_str(&format!(
-        r#"<line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="{}" stroke-width="1.5"/>"#,
-        cx + gap, cy - h, cx + gap, cy + h, COLOR_COMPONENT,
-    ));
-    buf.push_str(&format!(
-        r#"<line x1="{:.1}" y1="{:.1}" x2="{:.1}" y2="{:.1}" stroke="{}" stroke-width="1.5"/>"#,
-        cx + gap, cy, cx + half, cy, COLOR_COMPONENT,
-    ));
-}
-
-fn draw_inductor(buf: &mut String, cx: f64, cy: f64) {
-    let half = COMP_SPAN / 2.0;
-    let r = 8.0;
-    let loops = 4;
-    let spacing = COMP_SPAN / (loops as f64 + 1.0);
-    let mut d = format!("M {:.1} {:.1} ", cx - half, cy);
-    for i in 0..loops {
-        let sx = cx - half + spacing * i as f64 + spacing;
-        let sweep = if i % 2 == 0 { 1 } else { 0 };
-        d.push_str(&format!(
-            "A {r:.1} {r:.1} 0 0 {} {:.1} {:.1} ",
-            sweep, sx, cy
-        ));
-    }
-    d.push_str(&format!("L {:.1} {:.1}", cx + half, cy));
-    buf.push_str(&format!(
-        r#"<path d="{}" fill="none" stroke="{}" stroke-width="1.5"/>"#,
-        d, COLOR_COMPONENT
-    ));
-}
-
-// ============================================================
-// Step 2: Grid Visualization Rendering
-// ============================================================
-
-use crate::parser::{NodeSpan, NodeType, SchematicNode, WireSegment, HALF_SPAN, MARGIN};
-
-pub const CELL_W: f64 = 60.0;
-pub const CELL_H: f64 = 60.0;
 
 /// Render a debug grid showing every [`SchematicNode`] at its compressed
-/// grid position `(grid_col * CELL_W, grid_row * CELL_H)`, with light grey
-/// grid lines and row/column headers.
+/// grid position, with light grey grid lines and row/column headers.
 pub fn generate_grid(nodes: &[SchematicNode]) -> String {
     let max_row = nodes.iter().map(|n| n.grid_row).max().unwrap_or(0);
     let max_col = nodes.iter().map(|n| n.grid_col).max().unwrap_or(0);
@@ -256,51 +37,36 @@ pub fn generate_grid(nodes: &[SchematicNode]) -> String {
 
     let mut elements = String::new();
 
-    // ---- vertical grid lines + column headers --------------------------
     for c in 0..=max_col {
         let x = MARGIN + c as f64 * CELL_W;
         elements.push_str(&format!(
             "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
              stroke=\"#e0e0e0\" stroke-width=\"1\"/>",
-            x,
-            MARGIN,
-            x,
-            MARGIN + (max_row as f64 + 1.0) * CELL_H,
+            x, MARGIN, x, MARGIN + (max_row as f64 + 1.0) * CELL_H,
         ));
         elements.push_str(&format!(
             "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" \
              font-size=\"12\" fill=\"#999\">C{}</text>",
-            x,
-            MARGIN - 12.0,
-            c
+            x, MARGIN - 12.0, c
         ));
     }
-
-    // ---- horizontal grid lines + row headers ---------------------------
     for r in 0..=max_row {
         let y = MARGIN + r as f64 * CELL_H;
         elements.push_str(&format!(
             "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
              stroke=\"#e0e0e0\" stroke-width=\"1\"/>",
-            MARGIN,
-            y,
-            MARGIN + (max_col as f64 + 1.0) * CELL_W,
-            y,
+            MARGIN, y, MARGIN + (max_col as f64 + 1.0) * CELL_W, y,
         ));
         elements.push_str(&format!(
             "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"end\" \
              font-size=\"12\" fill=\"#999\">R{}</text>",
-            MARGIN - 12.0,
-            y + 5.0,
-            r
+            MARGIN - 12.0, y + 5.0, r
         ));
     }
 
-    // ---- nodes ---------------------------------------------------------
     for node in nodes {
         let x = MARGIN + node.grid_col as f64 * CELL_W;
         let y = MARGIN + node.grid_row as f64 * CELL_H;
-
         match &node.node_type {
             NodeType::Label(name) => {
                 elements.push_str(&format!(
@@ -309,11 +75,13 @@ pub fn generate_grid(nodes: &[SchematicNode]) -> String {
                     x, y + 5.0, name, node.grid_row, node.grid_col
                 ));
             }
-            NodeType::Port { refdes, pin } => {
+            NodeType::Port { refdes, pin, name, dir } => {
+                let name_part = if name.is_empty() { String::new() }
+                    else { format!("({})", name) };
                 elements.push_str(&format!(
                     "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" \
-                     font-size=\"14\" font-weight=\"bold\" fill=\"#8B0000\">{}:{} ({},{})</text>",
-                    x, y + 5.0, refdes, pin, node.grid_row, node.grid_col
+                     font-size=\"14\" font-weight=\"bold\" fill=\"#8B0000\">{}:{}{}{} ({},{})</text>",
+                    x, y + 5.0, refdes, pin, name_part, dir.to_char(), node.grid_row, node.grid_col
                 ));
             }
             NodeType::Junction => {
@@ -349,58 +117,82 @@ pub fn generate_grid(nodes: &[SchematicNode]) -> String {
     )
 }
 
-// ============================================================
-// Step 3: Component Symbol Rendering
-// ============================================================
+/// Convert a KiCad-style arc (defined by three points: start, mid, end) into
+/// an SVG arc path command `A rx ry xrot large-arc sweep x y`.
+fn arc_to_svg(start: (f64, f64), mid: (f64, f64), end: (f64, f64)) -> String {
+    let (x1, y1) = start;
+    let (x2, y2) = mid;
+    let (x3, y3) = end;
 
-use crate::parser::{Orientation, PlacedComponent};
+    let d = 2.0 * (x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2));
+    if d.abs() < 1e-9 {
+        return format!("L {:.1} {:.1}", x3, y3);
+    }
 
-const SYMBOL_SPAN: f64 = 56.0; // total symbol width in SVG px
+    let cx = ((x1.powi(2) + y1.powi(2)) * (y2 - y3)
+        + (x2.powi(2) + y2.powi(2)) * (y3 - y1)
+        + (x3.powi(2) + y3.powi(2)) * (y1 - y2))
+        / d;
+    let cy = ((x1.powi(2) + y1.powi(2)) * (x3 - x2)
+        + (x2.powi(2) + y2.powi(2)) * (x1 - x3)
+        + (x3.powi(2) + y3.powi(2)) * (x2 - x1))
+        / d;
+    let r = ((x1 - cx).powi(2) + (y1 - cy).powi(2)).sqrt();
 
-/// Render grid + labels + placed component symbols + wires + junction dots.
+    let cross = (x2 - x1) * (y3 - y1) - (y2 - y1) * (x3 - x1);
+    let sweep = if cross > 0.0 { 1 } else { 0 };
+
+    format!("A {:.1} {:.1} 0 0 {} {:.1} {:.1}", r, r, sweep, x3, y3)
+}
+
+/// Render grid + labels + matched component symbols + wires + junction dots.
 /// Uses dynamic `col_x` / `row_y` arrays from [`crate::parser::compute_layout`].
 pub fn generate_step3(
     nodes: &[SchematicNode],
-    placed: &[PlacedComponent],
     wires: &[WireSegment],
     col_x: &[f64],
     row_y: &[f64],
+    matched: &[MatchedComponent],
 ) -> String {
     let max_row = nodes.iter().map(|n| n.grid_row).max().unwrap_or(0);
     let max_col = nodes.iter().map(|n| n.grid_col).max().unwrap_or(0);
 
-    let last_x = col_x[max_col];
-    let last_y = row_y[max_row];
-    let width = last_x + MARGIN + 20.0;
-    let height = last_y + MARGIN + 20.0;
+    let col_px: Vec<f64> = col_x.iter().map(|&x| mm_to_px(x)).collect();
+    let row_px: Vec<f64> = row_y.iter().map(|&y| mm_to_px(y)).collect();
+    let margin_px = mm_to_px(MARGIN);
+
+    let last_x = col_px[max_col];
+    let last_y = row_px[max_row];
+    let width = last_x + margin_px + 20.0;
+    let height = last_y + margin_px + 20.0;
 
     let mut elements = String::new();
 
-    // ---- grid lines + headers (dynamic positions) -----------------------
+    // ---- grid lines + headers --------------------------------------------
     for c in 0..=max_col {
-        let x = col_x[c];
+        let x = col_px[c];
         elements.push_str(&format!(
             "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
              stroke=\"#e0e0e0\" stroke-width=\"1\"/>",
-            x, MARGIN, x, last_y,
+            x, margin_px, x, last_y,
         ));
         elements.push_str(&format!(
             "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" \
              font-size=\"12\" fill=\"#999\">C{}</text>",
-            x, MARGIN - 12.0, c
+            x, margin_px - 12.0, c
         ));
     }
     for r in 0..=max_row {
-        let y = row_y[r];
+        let y = row_px[r];
         elements.push_str(&format!(
             "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
              stroke=\"#e0e0e0\" stroke-width=\"1\"/>",
-            MARGIN, y, last_x, y,
+            margin_px, y, last_x, y,
         ));
         elements.push_str(&format!(
             "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"end\" \
              font-size=\"12\" fill=\"#999\">R{}</text>",
-            MARGIN - 12.0, y + 5.0, r
+            margin_px - 12.0, y + 5.0, r
         ));
     }
 
@@ -409,15 +201,15 @@ pub fn generate_step3(
         elements.push_str(&format!(
             "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
              stroke=\"#1a1a1a\" stroke-width=\"2\" stroke-linecap=\"round\"/>",
-            seg.x1, seg.y1, seg.x2, seg.y2
+            mm_to_px(seg.x1), mm_to_px(seg.y1), mm_to_px(seg.x2), mm_to_px(seg.y2)
         ));
     }
 
     // ---- labels ----------------------------------------------------------
     for node in nodes {
         if let NodeType::Label(name) = &node.node_type {
-            let x = col_x[node.grid_col];
-            let y = row_y[node.grid_row];
+            let x = col_px[node.grid_col];
+            let y = row_px[node.grid_row];
             elements.push_str(&format!(
                 "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" \
                  font-size=\"14\" font-weight=\"bold\" fill=\"#1B5E20\">{}</text>",
@@ -426,78 +218,210 @@ pub fn generate_step3(
         }
     }
 
-    // ---- component symbols -----------------------------------------------
-    for comp in placed {
-        let (cx, cy) = crate::parser::component_physical_center(comp, col_x, row_y);
+    // ---- ports (red dots + text) -----------------------------------------
+    for node in nodes {
+        if let NodeType::Port { refdes, pin, name, dir } = &node.node_type {
+            let x = col_px[node.grid_col];
+            let y = row_px[node.grid_row];
+            elements.push_str(&format!(
+                "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"4\" fill=\"#cc0000\"/>",
+                x, y
+            ));
+            let name_part = if name.is_empty() { String::new() }
+                else { format!("({})", name) };
+            elements.push_str(&format!(
+                "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" \
+                 font-size=\"11\" font-weight=\"bold\" fill=\"#8B0000\">{}:{}{}{} ({},{})</text>",
+                x, y - 10.0, refdes, pin, name_part, dir.to_char(), node.grid_row, node.grid_col
+            ));
+        }
+    }
 
-        let rot = match comp.orientation {
-            Orientation::Horizontal => 0,
-            Orientation::Vertical => 90,
-        };
+    // ---- matched component symbols (unified anchor-based rendering) -------
+    for comp in matched {
+        // Find the anchor pin — the one at the anchor grid position.
+        let anchor_pin = comp.pins.iter()
+            .find(|p| p.grid_row == comp.anchor_grid_row && p.grid_col == comp.anchor_grid_col)
+            .unwrap();
 
-        elements.push_str(&format!(
-            "<g transform=\"rotate({},{:.1},{:.1})\">", rot, cx, cy
-        ));
+        // Group origin = anchor pin's grid position in px.
+        let ax = col_px[comp.anchor_grid_col];
+        let ay = row_px[comp.anchor_grid_row];
+        let angle = comp.angle;
 
-        match comp.comp_type {
-            crate::CompType::Resistor => draw_resistor_at(&mut elements, cx, cy),
-            crate::CompType::Capacitor => draw_capacitor_at(&mut elements, cx, cy),
-            crate::CompType::Inductor => draw_inductor_at(&mut elements, cx, cy),
+        // Anchor pin tmpl_phys offset in px — shift everything so the
+        // anchor pin lands at local (0, 0) = group origin = grid position.
+        let off_x = anchor_pin.tmpl_phys_x * SVG_PX_PER_MM;
+        let off_y = anchor_pin.tmpl_phys_y * SVG_PX_PER_MM;
+
+        let to_px = |mm: f64| -> f64 { (mm / 2.54 * CELL_W).max(0.8) };
+
+        if !comp.draw_primitives.is_empty() {
+            elements.push_str(&format!(
+                "<g transform=\"translate({:.1},{:.1}) rotate({:.0})\">",
+                ax, ay, angle
+            ));
+
+            for dp in &comp.draw_primitives {
+                match dp {
+                    DrawPrimitive::Polyline { pts, stroke_width, fill_type } => {
+                        let fill = match fill_type.as_str() {
+                            "background" => "rgba(255,255,180,0.25)",
+                            "outline" => "#8B0000",
+                            _ => "none",
+                        };
+                        let points_str: Vec<String> = pts.iter().map(|(gx, gy)| {
+                            format!("{:.1},{:.1}",
+                                gx * CELL_W - off_x,
+                                gy * CELL_H - off_y)
+                        }).collect();
+                        let sw = to_px(*stroke_width);
+                        elements.push_str(&format!(
+                            "<polygon points=\"{}\" fill=\"{}\" \
+                             stroke=\"#8B0000\" stroke-width=\"{:.1}\"/>",
+                            points_str.join(" "), fill, sw
+                        ));
+                    }
+                    DrawPrimitive::Rectangle { start, end, stroke_width, fill_type } => {
+                        let fill = match fill_type.as_str() {
+                            "background" => "rgba(255,255,180,0.25)",
+                            "outline" => "#8B0000",
+                            _ => "none",
+                        };
+                        let x = start.0.min(end.0) * CELL_W - off_x;
+                        let y = start.1.min(end.1) * CELL_H - off_y;
+                        let w = (end.0 - start.0).abs() * CELL_W;
+                        let h = (end.1 - start.1).abs() * CELL_H;
+                        let sw = to_px(*stroke_width);
+                        elements.push_str(&format!(
+                            "<rect x=\"{:.1}\" y=\"{:.1}\" width=\"{:.1}\" height=\"{:.1}\" \
+                             fill=\"{}\" stroke=\"#8B0000\" stroke-width=\"{:.1}\"/>",
+                            x, y, w, h, fill, sw
+                        ));
+                    }
+                    DrawPrimitive::Arc { start, mid, end, stroke_width, fill_type } => {
+                        let fill = match fill_type.as_str() {
+                            "background" => "rgba(255,255,180,0.25)",
+                            "outline" => "#8B0000",
+                            _ => "none",
+                        };
+                        let sx = start.0 * CELL_W - off_x;
+                        let sy = start.1 * CELL_H - off_y;
+                        let mx = mid.0 * CELL_W - off_x;
+                        let my = mid.1 * CELL_H - off_y;
+                        let ex = end.0 * CELL_W - off_x;
+                        let ey = end.1 * CELL_H - off_y;
+                        let sw = to_px(*stroke_width);
+                        let a = arc_to_svg((sx, sy), (mx, my), (ex, ey));
+                        elements.push_str(&format!(
+                            "<path d=\"M {:.1} {:.1} {}\" \
+                             fill=\"{}\" stroke=\"#8B0000\" stroke-width=\"{:.1}\"/>",
+                            sx, sy, a, fill, sw
+                        ));
+                    }
+                    DrawPrimitive::Circle { center, radius, stroke_width, fill_type } => {
+                        let fill = match fill_type.as_str() {
+                            "background" => "rgba(255,255,180,0.25)",
+                            "outline" => "#8B0000",
+                            _ => "none",
+                        };
+                        let cx = center.0 * CELL_W - off_x;
+                        let cy = center.1 * CELL_H - off_y;
+                        let r = radius * CELL_W;
+                        let sw = to_px(*stroke_width);
+                        elements.push_str(&format!(
+                            "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"{:.1}\" \
+                             fill=\"{}\" stroke=\"#8B0000\" stroke-width=\"{:.1}\"/>",
+                            cx, cy, r, fill, sw
+                        ));
+                    }
+                }
+            }
+
+            // Pin connection lines — from pin tmpl_phys position inward
+            // toward the body.  All positions are shifted by -off so the
+            // anchor pin lands at local (0, 0).
+            for p in &comp.pins {
+                let lx = p.tmpl_phys_x * SVG_PX_PER_MM - off_x;
+                let ly = p.tmpl_phys_y * SVG_PX_PER_MM - off_y;
+                let len_px = (p.pin_length_mm / 2.54) * CELL_W;
+                let local_dir = rotate_pin_dir(p.dir, angle);
+                let (ix, iy) = match local_dir {
+                    PinDirection::Left  => (lx + len_px, ly),
+                    PinDirection::Right => (lx - len_px, ly),
+                    PinDirection::Up    => (lx, ly + len_px),
+                    PinDirection::Down  => (lx, ly - len_px),
+                };
+                elements.push_str(&format!(
+                    "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
+                     stroke=\"#8B0000\" stroke-width=\"1.2\"/>",
+                    lx, ly, ix, iy
+                ));
+
+                let label = if p.name.is_empty() {
+                    format!("{}:{}", comp.refdes, p.pin_num)
+                } else {
+                    format!("{}:{}({})", comp.refdes, p.pin_num, p.name)
+                };
+                elements.push_str(&format!(
+                    "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"start\" \
+                     font-size=\"9\" fill=\"#8B0000\">{}</text>",
+                    lx + 8.0, ly - 8.0, label
+                ));
+            }
+
+            elements.push_str("</g>");
         }
 
-        // refdes label above symbol
+        // refdes label placed near the anchor
         elements.push_str(&format!(
             "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" \
              font-size=\"12\" fill=\"#8B0000\">{}</text>",
-            cx, cy - 20.0, comp.refdes
+            ax, ay - mm_to_px(3.0), comp.refdes
         ));
-
-        elements.push_str("</g>");
     }
 
     // ---- junction dots ---------------------------------------------------
     for node in nodes {
         if matches!(node.node_type, NodeType::Junction) {
-            let cx = col_x[node.grid_col];
-            let cy = row_y[node.grid_row];
+            let cx = col_px[node.grid_col];
+            let cy = row_px[node.grid_row];
             elements.push_str(&format!(
                 "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"3.5\" fill=\"#1a1a1a\"/>",
                 cx, cy
             ));
         }
-        // Corner nodes ('+') get NO dot — they are pure wire crossings
     }
 
-    // ---- bounding boxes (span visualization) ---------------------------
+    // ---- bounding boxes (span visualization) -----------------------------
     for r in 0..=max_row {
         for c in 0..=max_col {
-            let cx = col_x[c];
-            let cy = row_y[r];
-
+            let cx = col_px[c];
+            let cy = row_px[r];
             let node = nodes.iter().find(|n| n.grid_row == r && n.grid_col == c);
             let s = match node {
                 Some(n) => n.span,
-                None => NodeSpan {
-                    left: HALF_SPAN,
-                    right: HALF_SPAN,
-                    up: HALF_SPAN,
-                    down: HALF_SPAN,
-                },
+                None => NodeSpan { left: HALF_SPAN, right: HALF_SPAN, up: HALF_SPAN, down: HALF_SPAN },
             };
-
             let kind = if node.is_some() { "node" } else { "empty" };
             elements.push_str(&format!(
                 "<rect class=\"span-box span-{kind}\" x=\"{x:.1}\" y=\"{y:.1}\" \
                  width=\"{w:.1}\" height=\"{h:.1}\"/>",
                 kind = kind,
-                x = cx - s.left,
-                y = cy - s.up,
-                w = s.left + s.right,
-                h = s.up + s.down,
+                x = cx - mm_to_px(s.left),
+                y = cy - mm_to_px(s.up),
+                w = mm_to_px(s.left + s.right),
+                h = mm_to_px(s.up + s.down),
             ));
         }
     }
 
+    let arrow_defs = r##"<defs>
+    <marker id="arrow" markerWidth="6" markerHeight="6"
+     refX="6" refY="3" orient="auto">
+     <path d="M0,0 L6,3 L0,6 Z" fill="#8B0000"/>
+    </marker>
+</defs>"##;
     let style = r#"<style>
     text { font-family: monospace; }
     .span-box { fill: none; stroke-width: 1; stroke-dasharray: 4,4; }
@@ -507,75 +431,7 @@ pub fn generate_step3(
 
     format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" \
-         viewBox=\"0 0 {:.0} {:.0}\" width=\"{:.0}\" height=\"{:.0}\">{}{}</svg>",
-        width, height, width, height, style, elements
+         viewBox=\"0 0 {:.0} {:.0}\" width=\"{:.0}\" height=\"{:.0}\">{}{}{}</svg>",
+        width, height, width, height, arrow_defs, style, elements
     )
-}
-
-// ---- Step 3 symbol drawing helpers (origin-centred, horizontal) ---------
-
-fn draw_resistor_at(buf: &mut String, cx: f64, cy: f64) {
-    let half = SYMBOL_SPAN / 2.0;
-    let h = 12.0;
-    let segs = 6;
-    let step = SYMBOL_SPAN / segs as f64;
-    let mut d = format!("M {:.1} {:.1} ", cx - half, cy);
-    for i in 0..segs {
-        let sx = cx - half + step * i as f64 + step / 2.0;
-        let sy = if i % 2 == 0 { cy - h } else { cy + h };
-        d.push_str(&format!("L {:.1} {:.1} ", sx, sy));
-    }
-    d.push_str(&format!("L {:.1} {:.1}", cx + half, cy));
-    buf.push_str(&format!(
-        "<path d=\"{}\" fill=\"none\" stroke=\"#8B0000\" stroke-width=\"1.5\"/>",
-        d
-    ));
-}
-
-fn draw_capacitor_at(buf: &mut String, cx: f64, cy: f64) {
-    let half = SYMBOL_SPAN / 2.0;
-    let gap = 5.0;
-    let h = 16.0;
-
-    buf.push_str(&format!(
-        "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
-         stroke=\"#8B0000\" stroke-width=\"1.5\"/>",
-        cx - half, cy, cx - gap, cy,
-    ));
-    buf.push_str(&format!(
-        "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
-         stroke=\"#8B0000\" stroke-width=\"1.5\"/>",
-        cx - gap, cy - h, cx - gap, cy + h,
-    ));
-    buf.push_str(&format!(
-        "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
-         stroke=\"#8B0000\" stroke-width=\"1.5\"/>",
-        cx + gap, cy - h, cx + gap, cy + h,
-    ));
-    buf.push_str(&format!(
-        "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
-         stroke=\"#8B0000\" stroke-width=\"1.5\"/>",
-        cx + gap, cy, cx + half, cy,
-    ));
-}
-
-fn draw_inductor_at(buf: &mut String, cx: f64, cy: f64) {
-    let half = SYMBOL_SPAN / 2.0;
-    let r = 7.0;
-    let loops = 4;
-    let spacing = SYMBOL_SPAN / (loops as f64 + 1.0);
-    let mut d = format!("M {:.1} {:.1} ", cx - half, cy);
-    for i in 0..loops {
-        let sx = cx - half + spacing * i as f64 + spacing;
-        let sweep = if i % 2 == 0 { 1 } else { 0 };
-        d.push_str(&format!(
-            "A {r:.1} {r:.1} 0 0 {} {:.1} {:.1} ",
-            sweep, sx, cy
-        ));
-    }
-    d.push_str(&format!("L {:.1} {:.1}", cx + half, cy));
-    buf.push_str(&format!(
-        "<path d=\"{}\" fill=\"none\" stroke=\"#8B0000\" stroke-width=\"1.5\"/>",
-        d
-    ));
 }
