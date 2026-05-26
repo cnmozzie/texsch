@@ -107,6 +107,20 @@ pub fn generate_grid(nodes: &[SchematicNode]) -> String {
                     x, y - 14.0, node.grid_row, node.grid_col
                 ));
             }
+            NodeType::Placeholder => {
+                elements.push_str(&format!(
+                    "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" \
+                     font-size=\"10\" fill=\"#ccc\">. ({},{})</text>",
+                    x, y + 5.0, node.grid_row, node.grid_col
+                ));
+            }
+            NodeType::Anchor { refdes } => {
+                elements.push_str(&format!(
+                    "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" \
+                     font-size=\"13\" font-weight=\"bold\" fill=\"#0055AA\">{} ({},{})</text>",
+                    x, y + 5.0, refdes, node.grid_row, node.grid_col
+                ));
+            }
         }
     }
 
@@ -145,26 +159,48 @@ fn arc_to_svg(start: (f64, f64), mid: (f64, f64), end: (f64, f64)) -> String {
     format!("A {:.1} {:.1} 0 0 {} {:.1} {:.1}", r, r, sweep, x3, y3)
 }
 
-/// Render grid + labels + matched component symbols + wires + junction dots.
-/// Uses dynamic `col_x` / `row_y` arrays from [`crate::parser::compute_layout`].
-pub fn generate_step3(
+/// Shared SVG preamble (defs + style) used by all grid renderers.
+fn svg_preamble() -> String {
+    let arrow_defs = r##"<defs>
+    <marker id="arrow" markerWidth="6" markerHeight="6"
+     refX="6" refY="3" orient="auto">
+     <path d="M0,0 L6,3 L0,6 Z" fill="#8B0000"/>
+    </marker>
+</defs>"##;
+    let style = r#"<style>
+    text { font-family: monospace; }
+    .span-box { fill: none; stroke-width: 1; stroke-dasharray: 4,4; }
+    .span-node { stroke: #a0c0ff; }
+    .span-empty { stroke: #e8e0d0; }
+</style>"#;
+    format!("{}{}", arrow_defs, style)
+}
+
+/// Grid spacing in px between two vertically stacked grids.
+const GRID_GAP_PX: f64 = 48.0;
+
+/// Render one grid's content elements (no outer `<svg>` wrapper).
+/// `y_base` offsets all Y coordinates for stacked-grid layouts.
+/// Returns `(elements_svg, width_px, height_px)`.
+fn render_grid_elements(
     nodes: &[SchematicNode],
     wires: &[WireSegment],
     col_x: &[f64],
     row_y: &[f64],
     matched: &[MatchedComponent],
-) -> String {
+    y_base: f64,
+) -> (String, f64, f64) {
     let max_row = nodes.iter().map(|n| n.grid_row).max().unwrap_or(0);
     let max_col = nodes.iter().map(|n| n.grid_col).max().unwrap_or(0);
 
     let col_px: Vec<f64> = col_x.iter().map(|&x| mm_to_px(x)).collect();
-    let row_px: Vec<f64> = row_y.iter().map(|&y| mm_to_px(y)).collect();
+    let row_px: Vec<f64> = row_y.iter().map(|&y| mm_to_px(y) + y_base).collect();
     let margin_px = mm_to_px(MARGIN);
 
     let last_x = col_px[max_col];
     let last_y = row_px[max_row];
     let width = last_x + margin_px + 20.0;
-    let height = last_y + margin_px + 20.0;
+    let height = last_y + margin_px + 20.0 - y_base;
 
     let mut elements = String::new();
 
@@ -174,12 +210,12 @@ pub fn generate_step3(
         elements.push_str(&format!(
             "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
              stroke=\"#e0e0e0\" stroke-width=\"1\"/>",
-            x, margin_px, x, last_y,
+            x, margin_px + y_base, x, last_y,
         ));
         elements.push_str(&format!(
             "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" \
              font-size=\"12\" fill=\"#999\">C{}</text>",
-            x, margin_px - 12.0, c
+            x, margin_px + y_base - 12.0, c
         ));
     }
     for r in 0..=max_row {
@@ -201,7 +237,8 @@ pub fn generate_step3(
         elements.push_str(&format!(
             "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
              stroke=\"#1a1a1a\" stroke-width=\"2\" stroke-linecap=\"round\"/>",
-            mm_to_px(seg.x1), mm_to_px(seg.y1), mm_to_px(seg.x2), mm_to_px(seg.y2)
+            mm_to_px(seg.x1), mm_to_px(seg.y1) + y_base,
+            mm_to_px(seg.x2), mm_to_px(seg.y2) + y_base,
         ));
     }
 
@@ -211,9 +248,10 @@ pub fn generate_step3(
             let x = col_px[node.grid_col];
             let y = row_px[node.grid_row];
             elements.push_str(&format!(
-                "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" \
-                 font-size=\"14\" font-weight=\"bold\" fill=\"#1B5E20\">{}</text>",
-                x, y + 5.0, name
+                "<g data-label=\"{}\">\
+                 <text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" \
+                 font-size=\"14\" font-weight=\"bold\" fill=\"#1B5E20\">{}</text></g>",
+                name, x, y + 5.0, name
             ));
         }
     }
@@ -239,18 +277,11 @@ pub fn generate_step3(
 
     // ---- matched component symbols (unified anchor-based rendering) -------
     for comp in matched {
-        // Find the anchor pin — the one at the anchor grid position.
-        let anchor_pin = comp.pins.iter()
-            .find(|p| p.grid_row == comp.anchor_grid_row && p.grid_col == comp.anchor_grid_col)
-            .unwrap();
-
-        // Group origin = anchor pin's grid position in px.
-        let ax = col_px[comp.anchor_grid_col];
-        let ay = row_px[comp.anchor_grid_row];
+        let anchor_pin = &comp.pins[0];
+        let ax = col_px[anchor_pin.grid_col];
+        let ay = row_px[anchor_pin.grid_row];
         let angle = comp.angle;
 
-        // Anchor pin tmpl_phys offset in px — shift everything so the
-        // anchor pin lands at local (0, 0) = group origin = grid position.
         let off_x = anchor_pin.tmpl_phys_x * SVG_PX_PER_MM;
         let off_y = anchor_pin.tmpl_phys_y * SVG_PX_PER_MM;
 
@@ -258,8 +289,8 @@ pub fn generate_step3(
 
         if !comp.draw_primitives.is_empty() {
             elements.push_str(&format!(
-                "<g transform=\"translate({:.1},{:.1}) rotate({:.0})\">",
-                ax, ay, angle
+                "<g transform=\"translate({:.1},{:.1}) rotate({:.0})\" data-refdes=\"{}\">",
+                ax, ay, angle, comp.refdes
             ));
 
             for dp in &comp.draw_primitives {
@@ -338,14 +369,12 @@ pub fn generate_step3(
                 }
             }
 
-            // Pin connection lines — from pin tmpl_phys position inward
-            // toward the body.  All positions are shifted by -off so the
-            // anchor pin lands at local (0, 0).
+            // Pin connection lines
             for p in &comp.pins {
                 let lx = p.tmpl_phys_x * SVG_PX_PER_MM - off_x;
                 let ly = p.tmpl_phys_y * SVG_PX_PER_MM - off_y;
                 let len_px = (p.pin_length_mm / 2.54) * CELL_W;
-                let local_dir = rotate_pin_dir(p.dir, angle);
+                let local_dir = p.dir;
                 let (ix, iy) = match local_dir {
                     PinDirection::Left  => (lx + len_px, ly),
                     PinDirection::Right => (lx - len_px, ly),
@@ -373,11 +402,12 @@ pub fn generate_step3(
             elements.push_str("</g>");
         }
 
-        // refdes label placed near the anchor
+        // refdes label
         elements.push_str(&format!(
-            "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" \
-             font-size=\"12\" fill=\"#8B0000\">{}</text>",
-            ax, ay - mm_to_px(3.0), comp.refdes
+            "<g data-refdes=\"{}\">\
+             <text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" \
+             font-size=\"12\" fill=\"#8B0000\">{}</text></g>",
+            comp.refdes, ax, ay - mm_to_px(3.0), comp.refdes
         ));
     }
 
@@ -416,22 +446,88 @@ pub fn generate_step3(
         }
     }
 
-    let arrow_defs = r##"<defs>
-    <marker id="arrow" markerWidth="6" markerHeight="6"
-     refX="6" refY="3" orient="auto">
-     <path d="M0,0 L6,3 L0,6 Z" fill="#8B0000"/>
-    </marker>
-</defs>"##;
-    let style = r#"<style>
-    text { font-family: monospace; }
-    .span-box { fill: none; stroke-width: 1; stroke-dasharray: 4,4; }
-    .span-node { stroke: #a0c0ff; }
-    .span-empty { stroke: #e8e0d0; }
-</style>"#;
+    (elements, width, height)
+}
+
+/// Render single-grid SVG (backward-compatible with existing callers).
+/// Uses dynamic `col_x` / `row_y` arrays from [`crate::parser::compute_layout`].
+pub fn generate_step3(
+    nodes: &[SchematicNode],
+    wires: &[WireSegment],
+    col_x: &[f64],
+    row_y: &[f64],
+    matched: &[MatchedComponent],
+) -> String {
+    let (elements, width, height) =
+        render_grid_elements(nodes, wires, col_x, row_y, matched, 0.0);
 
     format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" \
-         viewBox=\"0 0 {:.0} {:.0}\" width=\"{:.0}\" height=\"{:.0}\">{}{}{}</svg>",
-        width, height, width, height, arrow_defs, style, elements
+         viewBox=\"0 0 {:.0} {:.0}\" width=\"{:.0}\" height=\"{:.0}\">{}{}</svg>",
+        width, height, width, height,
+        svg_preamble(),
+        elements,
     )
+}
+
+/// Render dual-grid SVG: Grid 1 (main circuit) on top, dashed separator,
+/// Grid 2 (preview sandbox) below.  If `grid2` is `None`, renders Grid 1 only.
+pub fn generate_dual_grid(
+    nodes1: &[SchematicNode],
+    wires1: &[WireSegment],
+    col_x1: &[f64],
+    row_y1: &[f64],
+    matched1: &[MatchedComponent],
+    grid2: Option<(
+        &[SchematicNode],
+        &[WireSegment],
+        &[f64],
+        &[f64],
+        &[MatchedComponent],
+    )>,
+) -> String {
+    let (elements1, width1, height1) =
+        render_grid_elements(nodes1, wires1, col_x1, row_y1, matched1, 0.0);
+
+    if let Some((nodes2, wires2, col_x2, row_y2, matched2)) = grid2 {
+        let (elements2, width2, height2) =
+            render_grid_elements(nodes2, wires2, col_x2, row_y2, matched2, height1 + GRID_GAP_PX);
+
+        let total_width = width1.max(width2);
+        let total_height = height1 + GRID_GAP_PX + height2;
+
+        // Dashed separator line between the two grids.
+        let sep_y = height1 + GRID_GAP_PX / 2.0;
+        let separator = format!(
+            "<line x1=\"0\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" \
+             stroke=\"#b0b0b0\" stroke-width=\"1.5\" stroke-dasharray=\"8,6\"/>",
+            sep_y, total_width, sep_y
+        );
+
+        // Semi-transparent label for Grid 2 region.
+        let label = format!(
+            "<text x=\"{:.1}\" y=\"{:.1}\" text-anchor=\"middle\" \
+             font-size=\"11\" fill=\"#ccc\" font-family=\"monospace\">Component Preview</text>",
+            total_width / 2.0, height1 + GRID_GAP_PX - 6.0,
+        );
+
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" \
+             viewBox=\"0 0 {:.0} {:.0}\" width=\"{:.0}\" height=\"{:.0}\">{}{}{}{}{}</svg>",
+            total_width, total_height, total_width, total_height,
+            svg_preamble(),
+            elements1,
+            separator,
+            label,
+            elements2,
+        )
+    } else {
+        format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" \
+             viewBox=\"0 0 {:.0} {:.0}\" width=\"{:.0}\" height=\"{:.0}\">{}{}</svg>",
+            width1, height1, width1, height1,
+            svg_preamble(),
+            elements1,
+        )
+    }
 }

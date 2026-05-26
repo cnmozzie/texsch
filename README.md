@@ -7,31 +7,36 @@ U1: OPA330xxD
 R1: R
 R2: R
 R3: R
+R4: R
 J1: Conn_01x03_Socket
 J2: Conn_Coaxial
 J3: Conn_Coaxial
 J4: Conn_Coaxial
+#VCC1: VCC
+#VSS1: VSS
 #GND1: GND
 #GND2: GND
 #GND3: GND
 #GND4: GND
-#VCC1: VCC
-#VSS1: VSS
 =============================================
-[In1]--J3:1<                                                       #VCC1:1v
-        J3:2v                                                      |
-        |                                                          U1:7(V+)^
-        #GND3:1^                  +------------------------------U1:3(+)<
-                                  |                                       U1:6>--------*--------+--[OUT]
-                                  #GND1:1^             +---------U1:2(-)<              |        |
-[In2]--J4:1<                                           |           U1:4(V-)v           |        |
-        J4:2v                                          |           |                   |        +--J2:1<
-        |                                              |           #VSS1:1^            |            J2:2v
-        #GND4:1^            [In1]--R1:1< R1:2>---------*                               |            |
-                                                       |                               |            #GND2:1^
-[VCC]--J1:1<                [In2]--R2:1< R2:2>---------*                               |
-[GND]--J1:2<                                           |                               |
-[VSS]--J1:3<                                           +------------------R3:1< R3:2>--*
+
+ [in1] --<J3                                #VCC1
+          v                                 v
+          |                                 |
+          ^                                 ^
+          #GND3             +--------------<
+                            |                U1>----*-----+--[OUT]
+ [in2]---<J4                ^         +--- <        |     |
+          v                 #GND2     |     v       |     |
+          |            [In1]--<R1> -- *     |       |     |
+          ^                           |     ^       |     +--<J2
+          #GND4        [In2]--<R2> -- *     #VSS1   |         v
+                                      |             |         |
+                                      +------<R3>---+         ^
+ [VCC]----<                                                   #GND1
+ [GND]----<J1
+ [VSS]----<
+=============================================
 ```
 
 A grid of text produces a fully-routed schematic with standard KiCad library symbols — opamps, resistors, connectors, and power symbols — ready to open in KiCad or embed anywhere as SVG.
@@ -43,7 +48,8 @@ A grid of text produces a fully-routed schematic with standard KiCad library sym
 - **Dual output**: SVG render for visualization + KiCad `.kicad_sch` S-expression for EDA import
 - **Standard KiCad library symbols**: `Device:R/L/C`, `Amplifier_Operational:OPA330xxD`, `Connector:Conn_Coaxial`, `Connector:Conn_01x03_Socket`, `power:GND/VCC/VSS`
 - **Multi-pin symbols**: opamps and connectors with arbitrary pin counts and orientations
-- **Auto-orientation**: components automatically rotate to match their grid placement
+- **Auto-orientation**: components automatically solve rotation angle from grid placement (DAG solver with rigid rel_phys constraints)
+- **Dual Grid**: main circuit (Grid1) + component preview sandbox (Grid2), electrically isolated
 - **Power symbols**: `#`-prefixed refdes create global power symbols (GND, VCC, VSS)
 - **Zero server**: everything runs client-side via WebAssembly (Rust → WASM)
 
@@ -63,7 +69,7 @@ Open the URL printed by Vite (default `http://localhost:5173`). The default sche
 
 ```bash
 cd core
-cargo test    # run 94 tests
+cargo test    # run 97 tests
 cargo build   # compile native binary
 ```
 
@@ -83,7 +89,7 @@ A schematic has two sections: a **header** declaring which symbol each refdes us
 REFDES: SYMBOL_NAME
 ```
 
-Each line maps a reference designator to its symbol. The header ends with a line of `=` characters (at least 3).
+Each line maps a reference designator to its symbol. The header ends with the first line of `=` characters (at least 3). A second `====` separator can split the body into **Grid1** (main circuit) and **Grid2** (component preview / sandbox). Only Grid1 contributes to KiCad output.
 
 ```
 U1: OPA330xxD
@@ -96,18 +102,17 @@ Power symbols use a `#` prefix on the refdes (e.g. `#GND1`, `#VCC1`).
 
 ### Body — Nodes
 
-Place **nodes** at specific character positions and connect them with wire characters.
+Place **nodes** at specific character positions and connect them with wire characters. Each component occupies a **text-grid footprint**: the refdes text sits at the anchor position, and arrow characters (`<` `>` `^` `v`) placed at template-defined offsets mark its pins.
 
 | Token | Node Type | Description |
 |-------|-----------|-------------|
 | `[NAME]` | Label | Net label, e.g. `[VCC]`, `[GND]`, `[OUT]`, `[In1]` |
-| `R1:1<`, `R1:2>` | Port | Component pin — pin number followed by direction (`<` `>` `^` `v`) |
-| `U1:3(+)<` | Port | Pin with optional name in parentheses |
-| `#GND1:1^` | Power Port | Power-symbol pin with `#`-prefixed refdes |
+| `>`, `<`, `^`, `v` | Port | Arrow character defining a component pin with direction (template offset from refdes text) |
 | `*` | Junction | Electrical connection dot (wire intersection) |
 | `+` | Corner | Wire corner or crossing without electrical connection |
+| `.` | Placeholder | Empty cell preserving grid spacing (no wire) |
 
-Port directions are **required**: `<` (left), `>` (right), `^` (up), `v` (down).
+Arrow directions: `<` (left), `>` (right), `^` (up), `v` (down). The refdes text (e.g. `U1`, `R2`) sits at the component's anchor position, and arrow characters are placed around it according to the symbol template. The WASM `get_rotated_footprint` function returns the exact cell offsets for each rotation angle.
 
 ### Wires
 
@@ -115,38 +120,40 @@ Use `-` (dash) for horizontal wires between nodes on the same row. Use `|` (pipe
 
 ### Topology Examples
 
-**Horizontal resistor** (angle 90):
+**Horizontal resistor** (angle 0):
 ```
-R1:1<  R1:2>
+<R1>
 ```
 
-**Vertical capacitor** (angle 0):
+**Vertical resistor** (angle 90):
 ```
-C1:1^
-C1:2v
+ ^
+R1
+ v
 ```
 
 **T-Junction**:
 ```
 [VCC] ------- * ------- [OUT]
               |
-              R2:1<
+             <R2
 ```
 
 **Opamp in standard layout** (angle 0):
 ```
-           U1:7(V+)^
-U1:3(+)<
-                  U1:6>
-U1:2(-)<
-           U1:4(V-)v
+ ^
+<
+  U1>
+<
+ v
 ```
 
 **Power symbol wiring**:
 ```
-#VCC1:1v
+#VCC1
+v
 |
-U1:7(V+)^
+^
 ```
 
 ## Architecture
@@ -176,19 +183,21 @@ texsch/
 └── README.md
 ```
 
-**Pipeline**: ASCII text → `parse_header` + `scan_nodes` → `compress_coordinates` → `match_components` → `solve_orientations` → `compute_spans` → `compute_layout` → `compute_pin_ki_positions` + `extract_wires` → SVG + KiCad output
+**Pipeline**: ASCII text → `parse_header` + `scan_nodes` → `compress_coordinates` → `match_components` → `solve_orientations` → `apply_rotation_to_rel_phys` → `compute_spans` → `compute_layout` → `compute_pin_ki_positions` + `extract_wires` → SVG + KiCad output
 
 ### Steps
 
-1. **Header** — parse `REFDES: SYMBOL` mappings from the header section
-2. **Scan** — walk the 2D character grid, identify Labels, Junctions, Corners, and Ports with directions
+1. **Header** — parse `REFDES: SYMBOL` mappings from the header section; split into three sections (header, Grid1 body, Grid2 body)
+2. **Scan** — walk the 2D character grid, identify Labels, Junctions, Corners, Ports, and Placeholders
 3. **Compress** — map sparse absolute coordinates to dense grid indices
-4. **Match** — group ports by refdes, validate against symbol library templates
-5. **Orient** — solve component rotation angles from grid pin positions; auto-detect orientation
-6. **Span** — compute four-direction bounding boxes for each node based on type and orientation
-7. **Layout** — dynamic grid spacing (`col_x`, `row_y`) from span extents with configurable spacing
-8. **Wires** — grid-neighbor routing: connect adjacent nodes on same row if `-` present, same column if `|` present
-9. **Render** — SVG (symbols, wires, junction dots) and KiCad S-expression (symbols, wires, junctions, labels)
+4. **Match** — group port arrows by refdes, validate against symbol library templates; resolve pin grid positions
+5. **Orient** — solve component CW rotation angle from feature-pin grid positions
+6. **Rotate** — apply rotation to template rel_phys_x/y values for DAG constraints
+7. **Span** — compute four-direction bounding boxes for each node (rigid component constraints override span)
+8. **Layout** — DAG longest-path solver with independent col_x/row_y per grid; backward pass for pin-to-anchor spacing
+9. **Pin KiCad** — map pin KiCad positions from grid coords (ensures straight wires aligned with grid)
+10. **Wires** — grid-neighbor routing with endpoint snapping to port/label edges
+11. **Render** — SVG (dual-grid stacked: Grid1, dashed separator, Grid2) and KiCad S-expression (Grid1 only)
 
 ## Built-in Symbol Library
 

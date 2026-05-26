@@ -163,7 +163,10 @@ fn extract_kicad_wires(
     let mut node_at: std::collections::HashMap<(usize, usize), &SchematicNode> =
         std::collections::HashMap::new();
     for n in nodes {
-        node_at.insert((n.grid_row, n.grid_col), n);
+        // Placeholder dots do not participate in wire extraction.
+        if !matches!(n.node_type, NodeType::Placeholder) {
+            node_at.insert((n.grid_row, n.grid_col), n);
+        }
     }
 
     let mut wires = Vec::new();
@@ -300,11 +303,16 @@ pub fn generate_step3(
         let angle_deg = (360.0 - comp.angle) % 360.0;
         let angle: i32 = angle_deg as i32;
 
-        // Symbol origin from anchor grid position with rotation.
+        // Place the symbol so its anchor pin (pins[0]) lands exactly at its
+        // grid position.  The anchor pin is at local KiCad offset (anchor_ki_x,
+        // anchor_ki_y) from the symbol origin; subtracting that offset gives
+        // the symbol origin in canvas coordinates.
         let phi = comp.angle.to_radians();
-        let (sin_p, cos_p) = (phi.sin(), phi.cos());
-        let ox = col_x[comp.anchor_grid_col] - comp.anchor_ki_x * cos_p - comp.anchor_ki_y * sin_p;
-        let oy = row_y[comp.anchor_grid_row] - comp.anchor_ki_x * sin_p + comp.anchor_ki_y * cos_p;
+        let (sin_phi, cos_phi) = (phi.sin(), phi.cos());
+        let ap_col = comp.pins[0].grid_col;
+        let ap_row = comp.pins[0].grid_row;
+        let ox = col_x[ap_col] - comp.anchor_ki_x * cos_phi - comp.anchor_ki_y * sin_phi;
+        let oy = row_y[ap_row] - comp.anchor_ki_x * sin_phi + comp.anchor_ki_y * cos_phi;
         let (ax, ay) = (to_kicad_x(ox), to_kicad_y(oy));
         let uuid_base = 6000 + i as u128 * 100;
 
